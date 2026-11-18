@@ -91,3 +91,11 @@ export async function executeSyncApplyWorkflow(payload) {
   });
 }
 
+export async function suggestSubtaskNames(payload) {
+  const { data } = await request('/ai/suggest-subtask-names', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+  return data;
+}
+

@@ -157,6 +157,7 @@
                 hide-details
                 :disabled="submitting || Boolean(item.createdSubtask)"
                 class="linear-subtask-input flex-grow-1"
+                @update:model-value="onSummaryInput(item, $event)"
               />
 
               <!-- Created Badge & Link -->
@@ -186,6 +187,46 @@
                 title="Remove subtask"
                 @click="removeSubtaskRow(item.id)"
               />
+            </div>
+
+            <!-- AI name suggestions (debounced, click to apply only) -->
+            <div
+              v-if="item.suggestionsLoading"
+              class="text-caption text-medium-emphasis mt-1 pl-9 d-flex align-center"
+            >
+              <v-progress-circular
+                size="12"
+                width="2"
+                indeterminate
+                color="primary"
+                class="mr-2"
+              />
+              AI is suggesting names...
+            </div>
+            <div
+              v-else-if="item.suggestions.length"
+              class="mt-1 pl-9 d-flex flex-wrap align-center ga-1"
+            >
+              <span class="text-caption text-medium-emphasis mr-1">
+                ✨ AI suggestions (click to apply):
+              </span>
+              <v-chip
+                v-for="suggestion in item.suggestions"
+                :key="suggestion"
+                size="small"
+                variant="tonal"
+                color="secondary"
+                class="cursor-pointer"
+                @click="applySuggestion(item, suggestion)"
+              >
+                {{ suggestion }}
+              </v-chip>
+            </div>
+            <div
+              v-else-if="item.suggestionError"
+              class="text-caption text-error mt-1 pl-9"
+            >
+              {{ item.suggestionError }}
             </div>
 
             <div
@@ -401,8 +442,11 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue';
-import { executeCreateBatchSubtasksWorkflow } from '../services/apiClient.js';
+import { ref, computed, onBeforeUnmount } from 'vue';
+import {
+  executeCreateBatchSubtasksWorkflow,
+  suggestSubtaskNames,
+} from '../services/apiClient.js';
 
 const DEFAULT_PRESET_SUMMARIES = [
   '[DEV][BE] Create New Adapter For Call 3rd Party Endpoint /miniapp/api/v1/xxx/xxx/xxx',
@@ -421,6 +465,20 @@ const props = defineProps({
 const emit = defineEmits(['search-issues', 'update:selectedParentIssue']);
 
 let nextRowId = 1;
+
+const SUGGEST_DEBOUNCE_MS = 3000;
+const suggestionTimers = new Map();
+
+function createSuggestionState() {
+  return {
+    suggestions: [],
+    suggestionsLoading: false,
+    suggestionError: '',
+    lastSuggestedText: '',
+    suggestionRequestId: 0,
+  };
+}
+
 function createInitialRows() {
   return DEFAULT_PRESET_SUMMARIES.map((summary) => ({
     id: `subtask-row-${nextRowId++}`,
@@ -428,6 +486,7 @@ function createInitialRows() {
     summary,
     createdSubtask: null,
     error: null,
+    ...createSuggestionState(),
   }));
 }
 
@@ -501,16 +560,19 @@ function addSubtaskRow() {
     summary: '',
     createdSubtask: null,
     error: null,
+    ...createSuggestionState(),
   });
 }
 
 function removeSubtaskRow(id) {
   if (subtaskItems.value.length <= 1) return;
+  clearSuggestionTimer(id);
   subtaskItems.value = subtaskItems.value.filter((item) => item.id !== id);
 }
 
 function resetToPresets() {
   globalError.value = '';
+  clearAllSuggestionTimers();
   subtaskItems.value = createInitialRows();
 }
 
@@ -520,8 +582,104 @@ function startNewBatch() {
     item.createdSubtask = null;
     item.error = null;
     item.selected = true;
+    item.suggestions = [];
+    item.suggestionsLoading = false;
+    item.suggestionError = '';
+    item.lastSuggestedText = '';
   });
 }
+
+function clearSuggestionTimer(id) {
+  const timer = suggestionTimers.get(id);
+  if (timer) {
+    clearTimeout(timer);
+    suggestionTimers.delete(id);
+  }
+}
+
+function clearAllSuggestionTimers() {
+  for (const timer of suggestionTimers.values()) {
+    clearTimeout(timer);
+  }
+  suggestionTimers.clear();
+}
+
+function meaningfulLength(value) {
+  return String(value || '')
+    .replace(/^(\[[^\]]+\]\s*)+/, '')
+    .trim().length;
+}
+
+function onSummaryInput(item, value) {
+  item.summary = value;
+  clearSuggestionTimer(item.id);
+
+  const text = String(value || '').trim();
+  if (text !== item.lastSuggestedText) {
+    item.suggestions = [];
+    item.suggestionError = '';
+  }
+
+  if (item.createdSubtask || submitting.value) return;
+  if (text === item.lastSuggestedText) return;
+  if (meaningfulLength(text) < 3) return;
+
+  suggestionTimers.set(
+    item.id,
+    setTimeout(() => {
+      suggestionTimers.delete(item.id);
+      fetchSuggestions(item);
+    }, SUGGEST_DEBOUNCE_MS)
+  );
+}
+
+async function fetchSuggestions(item) {
+  const text = String(item.summary || '').trim();
+  if (!text || meaningfulLength(text) < 3) return;
+  if (item.createdSubtask || submitting.value) return;
+
+  const requestId = (item.suggestionRequestId || 0) + 1;
+  item.suggestionRequestId = requestId;
+  item.suggestionsLoading = true;
+  item.suggestionError = '';
+
+  try {
+    const data = await suggestSubtaskNames({
+      parentKey: props.selectedParentIssue?.key || '',
+      parentSummary: props.selectedParentIssue?.summary || '',
+      parentDescription: '',
+      draftName: text,
+      workType: 'API_DEVELOPMENT',
+    });
+
+    // Discard stale responses if the user kept typing.
+    if (item.suggestionRequestId !== requestId) return;
+    if (String(item.summary || '').trim() !== text) return;
+
+    item.lastSuggestedText = text;
+    item.suggestions = Array.isArray(data?.suggestions) ? data.suggestions : [];
+  } catch (err) {
+    if (item.suggestionRequestId === requestId) {
+      item.suggestionError = err.message || 'Failed to get AI suggestions.';
+    }
+  } finally {
+    if (item.suggestionRequestId === requestId) {
+      item.suggestionsLoading = false;
+    }
+  }
+}
+
+function applySuggestion(item, suggestion) {
+  clearSuggestionTimer(item.id);
+  item.lastSuggestedText = suggestion;
+  item.summary = suggestion;
+  item.suggestions = [];
+  item.suggestionError = '';
+}
+
+onBeforeUnmount(() => {
+  clearAllSuggestionTimers();
+});
 
 async function handleCreateBatch() {
   if (!canSubmitBatch.value) return;

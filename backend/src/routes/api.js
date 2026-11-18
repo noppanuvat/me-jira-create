@@ -18,7 +18,7 @@ import {
   getConfluencePageContent,
   updateConfluenceDocPage,
 } from '../services/confluenceService.js';
-import { analyzeJiraForConfluenceSync } from '../services/geminiService.js';
+import { analyzeJiraForConfluenceSync, suggestSubtaskNames } from '../services/geminiService.js';
 
 const router = Router();
 
@@ -31,6 +31,41 @@ router.get('/config/defaults', (req, res) => {
     defaults: config.defaults,
     templates: Object.values(TEMPLATE_METADATA),
   });
+});
+
+/**
+ * Suggests improved English subtask names (grammar + clarity) using Gemini.
+ * Triggered on demand (debounced in the UI) — never auto-applied to the input.
+ */
+router.post('/ai/suggest-subtask-names', async (req, res, next) => {
+  try {
+    const { parentKey, parentSummary, parentDescription, draftName, workType } =
+      req.body || {};
+    const draft = String(draftName || '').trim();
+
+    if (!draft) {
+      return res.status(400).json({
+        error: { message: 'draftName is required.' },
+      });
+    }
+    if (draft.length > 300) {
+      return res.status(400).json({
+        error: { message: 'draftName must be 300 characters or fewer.' },
+      });
+    }
+
+    const result = await suggestSubtaskNames({
+      parentKey: String(parentKey || '').trim(),
+      parentSummary: String(parentSummary || '').trim(),
+      parentDescription: String(parentDescription || '').slice(0, 2000),
+      draftName: draft,
+      workType: String(workType || '').trim(),
+    });
+
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
 });
 
 router.get('/jira/issues/search', async (req, res, next) => {

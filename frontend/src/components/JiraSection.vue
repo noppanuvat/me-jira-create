@@ -171,7 +171,7 @@
         label="Subtask Summary"
         placeholder="e.g. [API] Create QR Generation Endpoint"
         class="mb-2"
-        @update:model-value="$emit('update:subtaskSummary', $event)"
+        @update:model-value="onSubtaskInput"
       >
         <template #append-inner>
           <v-btn
@@ -186,6 +186,43 @@
           </v-btn>
         </template>
       </v-text-field>
+
+      <!-- AI name suggestions (debounced, click to apply only) -->
+      <div
+        v-if="suggestionsLoading"
+        class="text-caption text-medium-emphasis mb-3 d-flex align-center"
+      >
+        <v-progress-circular
+          size="12"
+          width="2"
+          indeterminate
+          color="primary"
+          class="mr-2"
+        />
+        AI is suggesting names...
+      </div>
+      <div
+        v-else-if="suggestions.length"
+        class="mb-3 d-flex flex-wrap align-center ga-1"
+      >
+        <span class="text-caption text-medium-emphasis mr-1">
+          ✨ AI suggestions (click to apply):
+        </span>
+        <v-chip
+          v-for="suggestion in suggestions"
+          :key="suggestion"
+          size="small"
+          variant="tonal"
+          color="secondary"
+          class="cursor-pointer"
+          @click="applySuggestion(suggestion)"
+        >
+          {{ suggestion }}
+        </v-chip>
+      </div>
+      <div v-else-if="suggestionError" class="text-caption text-error mb-3">
+        {{ suggestionError }}
+      </div>
 
       <!-- Subtask Description -->
       <v-textarea
@@ -203,8 +240,9 @@
 </template>
 
 <script setup>
-import { computed } from 'vue';
+import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { WORK_TYPE_OPTIONS } from '../utils/templateDefinitions.js';
+import { suggestSubtaskNames } from '../services/apiClient.js';
 
 const props = defineProps({
   parentIssues: {
@@ -273,6 +311,102 @@ function onSelectParentIssue(issue) {
 function onSelectWorkType(newType) {
   emit('update:workType', newType);
 }
+
+// AI subtask name suggestions (debounced 3s, click to apply only)
+const SUGGEST_DEBOUNCE_MS = 3000;
+const suggestions = ref([]);
+const suggestionsLoading = ref(false);
+const suggestionError = ref('');
+const lastSuggestedText = ref('');
+const latestDraft = ref(props.subtaskSummary || '');
+let suggestTimer = null;
+
+function meaningfulLength(value) {
+  return String(value || '')
+    .replace(/^(\[[^\]]+\]\s*)+/, '')
+    .trim().length;
+}
+
+function clearSuggestTimer() {
+  if (suggestTimer) {
+    clearTimeout(suggestTimer);
+    suggestTimer = null;
+  }
+}
+
+function onSubtaskInput(value) {
+  latestDraft.value = value;
+  emit('update:subtaskSummary', value);
+  clearSuggestTimer();
+
+  const text = String(value || '').trim();
+  if (text !== lastSuggestedText.value) {
+    suggestions.value = [];
+    suggestionError.value = '';
+  }
+
+  if (props.lockedSubtask) return;
+  if (text === lastSuggestedText.value) return;
+  if (meaningfulLength(text) < 3) return;
+
+  suggestTimer = setTimeout(() => {
+    suggestTimer = null;
+    fetchSuggestions(text);
+  }, SUGGEST_DEBOUNCE_MS);
+}
+
+async function fetchSuggestions(text) {
+  if (props.lockedSubtask) return;
+  suggestionsLoading.value = true;
+  suggestionError.value = '';
+
+  try {
+    const data = await suggestSubtaskNames({
+      parentKey: props.selectedParentIssue?.key || '',
+      parentSummary: props.selectedParentIssue?.summary || '',
+      parentDescription: '',
+      draftName: text,
+      workType: props.workType,
+    });
+
+    // Discard stale responses if the user kept typing.
+    if (String(latestDraft.value || '').trim() !== text) return;
+
+    lastSuggestedText.value = text;
+    suggestions.value = Array.isArray(data?.suggestions) ? data.suggestions : [];
+  } catch (err) {
+    if (String(latestDraft.value || '').trim() === text) {
+      suggestionError.value = err.message || 'Failed to get AI suggestions.';
+    }
+  } finally {
+    suggestionsLoading.value = false;
+  }
+}
+
+function applySuggestion(suggestion) {
+  clearSuggestTimer();
+  lastSuggestedText.value = suggestion;
+  suggestions.value = [];
+  suggestionError.value = '';
+  latestDraft.value = suggestion;
+  emit('update:subtaskSummary', suggestion);
+}
+
+watch(
+  () => props.subtaskSummary,
+  (value) => {
+    latestDraft.value = value;
+    const text = String(value || '').trim();
+    if (text !== lastSuggestedText.value) {
+      suggestions.value = [];
+      suggestionError.value = '';
+    }
+  }
+);
+
+onBeforeUnmount(() => {
+  clearSuggestTimer();
+});
 </script>
 
 <style scoped>

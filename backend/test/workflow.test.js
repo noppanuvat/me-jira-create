@@ -585,3 +585,73 @@ test('POST /api/workflow/create-batch-subtasks creates multiple subtasks under p
   );
 });
 
+test('POST /api/ai/suggest-subtask-names returns English grammar suggestions from Gemini', async () => {
+  process.env.GEMINI_API_KEY = 'test-gemini-key';
+  let capturedPrompt = '';
+
+  await withServer(
+    async (url, options) => {
+      if (url.includes('generativelanguage.googleapis.com')) {
+        const payload = JSON.parse(options.body);
+        capturedPrompt = payload.contents[0].parts[0].text;
+        return jsonResponse({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      suggestions: [
+                        '[DEV][BE] Implement Third-Party API Call for Payment Service',
+                        '[DEV][BE] Integrate Payment Service API Endpoint',
+                        '[DEV][BE] Create Adapter for Payment Service API',
+                      ],
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+        });
+      }
+      return jsonResponse({}, 404);
+    },
+    async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/api/ai/suggest-subtask-names`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          parentKey: 'ONEKSGA-100',
+          parentSummary: 'Payment Service Integration',
+          draftName: 'call api payment service',
+          workType: 'API_DEVELOPMENT',
+        }),
+      });
+
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(body.suggestions.length, 3);
+      assert.ok(body.suggestions.every((s) => typeof s === 'string' && s.length > 0));
+      assert.ok(capturedPrompt.includes('English'));
+      assert.ok(capturedPrompt.includes('call api payment service'));
+    }
+  );
+});
+
+test('POST /api/ai/suggest-subtask-names rejects an empty draftName', async () => {
+  await withServer(
+    async () => jsonResponse({}, 404),
+    async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/api/ai/suggest-subtask-names`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ draftName: '   ' }),
+      });
+
+      assert.equal(res.status, 400);
+      const body = await res.json();
+      assert.ok(body.error?.message);
+    }
+  );
+});
+

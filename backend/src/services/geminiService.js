@@ -299,3 +299,140 @@ export async function analyzeJiraForConfluenceSync({
     },
   };
 }
+
+const SUBTASK_SUGGESTION_LIMIT = 5;
+
+function cleanSuggestionText(value) {
+  return String(value || '')
+    .replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '')
+    .replace(/^["'`]+|["'`]+$/g, '')
+    .trim();
+}
+
+/**
+ * Suggests improved, grammatically correct English subtask names for a draft name.
+ * Used by the "AI suggestions" helper in the subtask name fields.
+ */
+export async function suggestSubtaskNames({
+  parentKey = '',
+  parentSummary = '',
+  parentDescription = '',
+  draftName = '',
+  workType = '',
+}) {
+  const config = getConfig();
+  const apiKey = config.gemini?.apiKey;
+  const model = config.gemini?.model || 'gemini-2.5-flash';
+  const draft = String(draftName || '').trim();
+
+  if (!draft) {
+    throw new AtlassianApiError('draftName is required to suggest subtask names.', 400);
+  }
+  if (!apiKey) {
+    throw new AtlassianApiError(
+      'GEMINI_API_KEY is not configured in .env. Please add GEMINI_API_KEY to use AI suggestions.',
+      400
+    );
+  }
+
+  const prompt = `You are a Jira subtask naming assistant for a software engineering team.
+Improve the grammar, spelling, and clarity of the draft subtask name and propose alternative names.
+
+Parent Jira Issue: ${parentKey || 'N/A'}${parentSummary ? ` — ${parentSummary}` : ''}
+Work Type: ${workType || 'N/A'}
+Draft Subtask Name: ${draft}
+
+Rules:
+- Output MUST be in English only.
+- Return 3 to ${SUBTASK_SUGGESTION_LIMIT} suggestions.
+- Keep each suggestion concise (about 90 characters or fewer).
+- Preserve the original intent and any leading bracket tags such as "[DEV][BE]", "[API]", or "[DB]".
+- Use professional, imperative Jira style: Create, Implement, Add, Update, Fix, Integrate, Handle.
+- Do not add numbering, bullet characters, quotes, markdown, or explanations.
+- Return ONLY valid JSON in this shape: {"suggestions": ["First suggestion", "Second suggestion"]}`;
+
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    model
+  )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: prompt }],
+        },
+      ],
+      generationConfig: {
+        temperature: 0.4,
+        responseMimeType: 'application/json',
+      },
+    }),
+  });
+
+  const rawBody = await response.text();
+  let data = null;
+  try {
+    data = rawBody ? JSON.parse(rawBody) : null;
+  } catch {
+    data = null;
+  }
+
+  if (!response.ok) {
+    const errMsg =
+      data?.error?.message || `Gemini API request failed with status ${response.status}`;
+    throw new AtlassianApiError(errMsg, response.status, data);
+  }
+
+  const candidateText =
+    data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
+  if (!candidateText.trim()) {
+    throw new AtlassianApiError('Gemini returned an empty suggestion response.', 502);
+  }
+
+  const cleaned = candidateText
+    .replace(/^```json\s*/i, '')
+    .replace(/```$/i, '')
+    .trim();
+
+  let parsed = null;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    parsed = null;
+  }
+
+  let suggestions = [];
+  if (Array.isArray(parsed?.suggestions)) {
+    suggestions = parsed.suggestions;
+  } else if (Array.isArray(parsed)) {
+    suggestions = parsed;
+  } else if (!parsed) {
+    suggestions = cleaned.split('\n');
+  }
+
+  const normalized = [];
+  const seen = new Set();
+  for (const item of suggestions) {
+    const text = cleanSuggestionText(item);
+    if (!text) continue;
+    const dedupeKey = text.toLowerCase();
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    normalized.push(text);
+    if (normalized.length >= SUBTASK_SUGGESTION_LIMIT) break;
+  }
+
+  if (normalized.length === 0) {
+    throw new AtlassianApiError(
+      'Gemini did not return any usable subtask name suggestions.',
+      502
+    );
+  }
+
+  return { model, draftName: draft, suggestions: normalized };
+}
