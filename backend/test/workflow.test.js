@@ -142,7 +142,7 @@ test('POST /api/workflow/create-all creates Jira Subtask, Confluence Page, and R
         capturedIssuePayload.fields.customfield_10114,
         'fcb6e51f-5ba0-4486-88fe-2de7448907a1'
       );
-      assert.ok(body.confluencePage.title.includes('[PAY-501]'));
+      assert.equal(body.confluencePage.title, 'API Spec: Create QR Generation Endpoint');
       assert.equal(body.remoteLink.linked, true);
     }
   );
@@ -229,7 +229,10 @@ test('Partial failure + retry-confluence flow does not duplicate Jira Subtask', 
       assert.equal(retryBody.retried, true);
       assert.equal(issueCreateCount, 1);
       assert.equal(retryBody.subtask.key, createdSubtaskKey);
-      assert.ok(retryBody.confluencePage.title.includes(`[${createdSubtaskKey}]`));
+      assert.equal(
+        retryBody.confluencePage.title,
+        'DB Design: Design kyc_verification_audit table'
+      );
       assert.equal(retryBody.remoteLink.subtaskKey, createdSubtaskKey);
     }
   );
