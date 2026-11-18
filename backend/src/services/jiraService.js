@@ -1,5 +1,9 @@
 import { getConfig } from '../config/env.js';
-import { atlassianRequest, AtlassianApiError } from '../clients/atlassianClient.js';
+import {
+  atlassianRequest,
+  AtlassianApiError,
+  buildAuthHeader,
+} from '../clients/atlassianClient.js';
 
 function buildAdfDocument(text = '') {
   const paragraphs = String(text || 'Created via Jira + Confluence Spec Creator')
@@ -16,6 +20,34 @@ function buildAdfDocument(text = '') {
       })
     ),
   };
+}
+
+const DEFAULT_DESCRIPTION = 'Created via Jira + Confluence Spec Creator';
+
+/**
+ * Accepts either a rich-text ADF document from the editor or the legacy plain
+ * string, and always returns a Jira-valid ADF doc node.
+ */
+export function normalizeDescription({ description, descriptionAdf } = {}) {
+  if (descriptionAdf && typeof descriptionAdf === 'object' && descriptionAdf.type === 'doc') {
+    const content = Array.isArray(descriptionAdf.content) ? descriptionAdf.content : [];
+    return { type: 'doc', version: 1, content: content.length ? content : [{ type: 'paragraph', content: [] }] };
+  }
+  return buildAdfDocument(description);
+}
+
+export async function searchJiraUsers(query = '') {
+  const trimmed = String(query || '').trim();
+  const data = await atlassianRequest(
+    `/rest/api/3/user/search?query=${encodeURIComponent(trimmed)}&maxResults=10`
+  );
+  return (Array.isArray(data) ? data : []).map((user) => ({
+    accountId: user.accountId,
+    displayName: user.displayName || user.emailAddress || 'Unknown user',
+    emailAddress: user.emailAddress || '',
+    avatarUrl: user.avatarUrls?.['24x24'] || '',
+    active: user.active !== false,
+  }));
 }
 
 export async function searchParentIssues(query = '') {
@@ -60,10 +92,152 @@ async function resolveSubtaskIssueTypeId(projectKey) {
   return subtaskType.id;
 }
 
+function parseDataUrl(dataUrl = '') {
+  const match = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(String(dataUrl));
+  if (!match) return null;
+  const mimeType = match[1] || 'image/png';
+  const isBase64 = Boolean(match[2]);
+  const buffer = isBase64
+    ? Buffer.from(match[3], 'base64')
+    : Buffer.from(decodeURIComponent(match[3]), 'utf8');
+  return { mimeType, buffer };
+}
+
+function atlassianAuthHeaders(extra = {}) {
+  const { email, apiToken } = getConfig().atlassian;
+  if (!email || !apiToken) {
+    throw new AtlassianApiError(
+      'Missing Atlassian credentials on server. Check ATLASSIAN_EMAIL and ATLASSIAN_API_TOKEN in .env.',
+      500
+    );
+  }
+  return { Authorization: buildAuthHeader(email, apiToken), ...extra };
+}
+
+async function uploadIssueAttachment(issueKey, { filename, dataUrl }) {
+  const parsed = parseDataUrl(dataUrl);
+  if (!parsed) {
+    throw new AtlassianApiError(`Invalid image payload for "${filename}".`, 400);
+  }
+  const { baseUrl } = getConfig().atlassian;
+  const form = new FormData();
+  form.append('file', new Blob([parsed.buffer], { type: parsed.mimeType }), filename || 'image.png');
+
+  const response = await fetch(
+    `${baseUrl}/rest/api/3/issue/${encodeURIComponent(issueKey)}/attachments`,
+    {
+      method: 'POST',
+      headers: atlassianAuthHeaders({ 'X-Atlassian-Token': 'no-check' }),
+      body: form,
+    }
+  );
+
+  const text = await response.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = { raw: text };
+  }
+  if (!response.ok) {
+    throw new AtlassianApiError(
+      data?.errorMessages?.join(', ') || `Attachment upload failed (${response.status})`,
+      response.status,
+      data
+    );
+  }
+  const attachment = Array.isArray(data) ? data[0] : data;
+  return { id: attachment?.id, filename: attachment?.filename || filename };
+}
+
+/**
+ * Jira media nodes need the Media Services UUID, which is only exposed through
+ * the attachment content redirect (…/file/<uuid>/binary).
+ */
+async function resolveAttachmentMediaId(attachmentId) {
+  const { baseUrl } = getConfig().atlassian;
+  const response = await fetch(
+    `${baseUrl}/rest/api/3/attachment/content/${encodeURIComponent(attachmentId)}`,
+    { method: 'GET', headers: atlassianAuthHeaders(), redirect: 'manual' }
+  );
+  const location = response.headers.get('location') || '';
+  const match = location.match(/\/file\/([0-9a-fA-F-]{20,})\//);
+  return match?.[1] || null;
+}
+
+function imageMarker(pendingId, filename) {
+  return `[[image:${pendingId}:${filename}]]`;
+}
+
+/** Replace pending mediaSingle nodes with text markers before the issue exists. */
+function adfWithMarkers(adf, images = []) {
+  const byId = new Map(images.map((img) => [img.pendingId, img]));
+  const walk = (node) => {
+    if (!node) return node;
+    if (node.type === 'mediaSingle') {
+      const media = (node.content || []).find((c) => c.type === 'media');
+      const id = media?.attrs?.id;
+      const img = byId.get(id);
+      if (img) {
+        return {
+          type: 'paragraph',
+          content: [{ type: 'text', text: imageMarker(img.pendingId, img.filename) }],
+        };
+      }
+      return node;
+    }
+    if (Array.isArray(node.content)) node.content = node.content.map(walk);
+    return node;
+  };
+  return walk(JSON.parse(JSON.stringify(adf)));
+}
+
+/** Swap markers back to real mediaSingle nodes once media ids are known. */
+function adfWithMediaMarkers(adf, images = []) {
+  const byMarker = new Map(
+    images.filter((img) => img.mediaId).map((img) => [imageMarker(img.pendingId, img.filename), img])
+  );
+  const walk = (node) => {
+    if (!node) return node;
+    if (node.type === 'paragraph') {
+      const text = (node.content || [])
+        .filter((c) => c.type === 'text')
+        .map((c) => c.text)
+        .join('');
+      const img = byMarker.get(text);
+      if (img) {
+        return {
+          type: 'mediaSingle',
+          attrs: { layout: 'center' },
+          content: [
+            {
+              type: 'media',
+              attrs: { type: 'file', id: img.mediaId, collection: '', alt: img.filename },
+            },
+          ],
+        };
+      }
+      return node;
+    }
+    if (Array.isArray(node.content)) node.content = node.content.map(walk);
+    return node;
+  };
+  return walk(JSON.parse(JSON.stringify(adf)));
+}
+
+async function updateIssueDescription(issueIdOrKey, adf) {
+  await atlassianRequest(`/rest/api/3/issue/${encodeURIComponent(issueIdOrKey)}`, {
+    method: 'PUT',
+    body: { fields: { description: adf } },
+  });
+}
+
 export async function createJiraSubtask({
   parentIssueKey,
   summary,
   description,
+  descriptionAdf,
+  images,
   workType,
 }) {
   const config = getConfig();
@@ -74,13 +248,22 @@ export async function createJiraSubtask({
   const projectKey = parentIssueKey.split('-')[0] || config.defaults.jiraProjectKey;
   const subtaskIssueTypeId = await resolveSubtaskIssueTypeId(projectKey);
 
+  const adf = normalizeDescription({
+    description: description || DEFAULT_DESCRIPTION,
+    descriptionAdf,
+  });
+  const imageList = Array.isArray(images)
+    ? images.filter((img) => img?.pendingId && img?.dataUrl)
+    : [];
+  const initialAdf = imageList.length ? adfWithMarkers(adf, imageList) : adf;
+
   const payload = {
     fields: {
       project: { key: projectKey },
       parent: { key: parentIssueKey },
       issuetype: { id: subtaskIssueTypeId },
       summary,
-      description: buildAdfDocument(description),
+      description: initialAdf,
       customfield_11505: { value: config.defaults.jiraSquad },
       customfield_10114: config.defaults.jiraTeamId,
     },
@@ -91,6 +274,40 @@ export async function createJiraSubtask({
     body: payload,
   });
 
+  // Upload inline images, resolve their Media Services ids, then rewrite the
+  // description so the images render inline exactly like the Jira editor.
+  const attachments = [];
+  const warnings = [];
+  if (imageList.length) {
+    for (const img of imageList) {
+      try {
+        const uploaded = await uploadIssueAttachment(created.key, img);
+        const mediaId = await resolveAttachmentMediaId(uploaded.id);
+        if (!mediaId) {
+          warnings.push(`Uploaded ${img.filename} as an attachment but could not embed it inline.`);
+          continue;
+        }
+        attachments.push({ filename: img.filename, attachmentId: uploaded.id, mediaId });
+      } catch (err) {
+        warnings.push(`Image "${img.filename}" failed: ${err.message}`);
+      }
+    }
+    if (attachments.length) {
+      try {
+        await updateIssueDescription(created.id, adfWithMediaMarkers(adf, attachments));
+      } catch (err) {
+        warnings.push(`Could not embed images in the description: ${err.message}`);
+      }
+    } else if (warnings.length) {
+      // Leftover markers are still readable, but strip them for a cleaner body.
+      try {
+        await updateIssueDescription(created.id, adf);
+      } catch {
+        /* non-fatal */
+      }
+    }
+  }
+
   return {
     id: created.id,
     key: created.key,
@@ -100,6 +317,8 @@ export async function createJiraSubtask({
     workType,
     squad: config.defaults.jiraSquad,
     team: config.defaults.jiraTeamName,
+    attachments,
+    warnings,
     url: `${config.atlassian.baseUrl}/browse/${created.key}`,
   };
 }

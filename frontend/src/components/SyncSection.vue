@@ -23,7 +23,7 @@
             class="font-weight-medium"
             prepend-icon="mdi-creation"
           >
-            {{ geminiConfigured ? `Gemini (${geminiModel})` : 'GEMINI_API_KEY Required' }}
+            {{ geminiConfigured ? `AI: ${geminiModel}` : 'AI Key Required' }}
           </v-chip>
         </div>
 
@@ -496,6 +496,10 @@ const props = defineProps({
     type: String,
     default: 'gemini-2.5-flash',
   },
+  aiModel: {
+    type: String,
+    default: '',
+  },
   initialIssueKey: {
     type: String,
     default: '',
@@ -625,6 +629,7 @@ async function handleAnalyzeWithAi() {
       issueKey: selectedIssue.value.key,
       confluencePageId: resolvedConfluencePageId.value || undefined,
       workType: workType.value,
+      model: props.aiModel,
     });
 
     issueContext.value = data.issueContext;

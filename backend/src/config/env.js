@@ -13,6 +13,24 @@ export function getConfig() {
   const apiToken = process.env.ATLASSIAN_API_TOKEN || '';
   const geminiApiKey = process.env.GEMINI_API_KEY || '';
   const geminiModel = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+  const openrouterApiKey = process.env.OPENROUTER_API_KEY || '';
+  const openrouterUrl =
+    process.env.OPENROUTER_API_URL || 'https://openrouter.ai/api/v1/chat/completions';
+  const aiModels = (
+    process.env.AI_MODELS ||
+    [
+      geminiModel,
+      'google/gemini-4-hydrogen',
+      'openai/gpt-6.1-terra',
+      'deepseek/deepseek-v4.1-flash-1017',
+      'z-ai/glm-5.3-flash',
+      'minimax/minimax-m3.1-flash:free',
+    ].join(',')
+  )
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const uniqueAiModels = [...new Set([geminiModel, ...aiModels])];
 
   return {
     port: Number(process.env.PORT || 3001),
@@ -26,6 +44,12 @@ export function getConfig() {
       apiKey: geminiApiKey,
       model: geminiModel,
     },
+    openrouter: {
+      apiKey: openrouterApiKey,
+      url: openrouterUrl,
+    },
+    aiModels: uniqueAiModels,
+    defaultAiModel: geminiModel,
     defaults: {
       jiraProjectKey: process.env.DEFAULT_JIRA_PROJECT_KEY || 'PAY',
       jiraSquad: process.env.DEFAULT_JIRA_SQUAD || 'SQ16',

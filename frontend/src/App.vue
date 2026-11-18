@@ -21,6 +21,19 @@
 
         <!-- Top Mode Switcher (Linear Segmented Pill Control) -->
         <div class="d-flex align-center ga-3">
+          <v-select
+            v-model="aiModel"
+            :items="aiModelOptions"
+            item-title="label"
+            item-value="id"
+            density="compact"
+            variant="outlined"
+            hide-details
+            prepend-inner-icon="mdi-robot-outline"
+            label="AI Model"
+            style="width: 280px"
+            class="mr-1"
+          />
           <div class="linear-segmented-group">
             <button
               type="button"
@@ -81,13 +94,17 @@
               :work-type="workType"
               :subtask-summary="subtaskSummary"
               :subtask-description="subtaskDescription"
+              :subtask-description-adf="subtaskDescriptionAdf"
               :locked-subtask="lockedSubtask"
+              :ai-model="aiModel"
               @search-issues="loadParentIssues"
               @update:selected-parent-issue="onParentIssueSelected"
               @update:create-confluence="createConfluence = $event"
               @update:work-type="onWorkTypeChanged"
               @update:subtask-summary="subtaskSummary = $event"
               @update:subtask-description="subtaskDescription = $event"
+              @update:subtask-description-adf="subtaskDescriptionAdf = $event"
+              @update:description-images="descriptionImages = $event"
               @apply-prefix="applyWorkTypePrefix"
             />
 
@@ -146,7 +163,8 @@
         <SyncSection
           v-else
           :gemini-configured="geminiConfigured"
-          :gemini-model="geminiModel"
+          :gemini-model="aiModel"
+          :ai-model="aiModel"
           :initial-issue-key="syncTargetIssueKey"
           :initial-confluence-page-id="syncTargetPageId"
         />
@@ -156,7 +174,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, onMounted, watch } from 'vue';
 import JiraSection from './components/JiraSection.vue';
 import ConfluenceSection from './components/ConfluenceSection.vue';
 import PreviewSection from './components/PreviewSection.vue';
@@ -181,6 +199,17 @@ const STORAGE_KEY_CREATE_PREFS = 'jira_doc_creator_create_prefs_v1';
 const activeMode = ref('CREATE');
 const geminiConfigured = ref(false);
 const geminiModel = ref('gemini-2.5-flash');
+const aiModel = ref('gemini-2.5-flash');
+const aiModels = ref(['gemini-2.5-flash']);
+const aiModelOptions = computed(() => aiModels.value.map((id) => ({ id, label: id })));
+
+watch(aiModel, (value) => {
+  try {
+    window.localStorage.setItem('jira_doc_creator_ai_model', value);
+  } catch {
+    // Ignore storage errors
+  }
+});
 const syncTargetIssueKey = ref('');
 const syncTargetPageId = ref('');
 
@@ -190,9 +219,9 @@ const loadingIssues = ref(false);
 const selectedParentIssue = ref(null);
 const workType = ref('API_DEVELOPMENT');
 const subtaskSummary = ref('');
-const subtaskDescription = ref(
-  ''
-);
+const subtaskDescription = ref('');
+const subtaskDescriptionAdf = ref(null);
+const descriptionImages = ref([]);
 
 // Section 2 State: Confluence Template & Destination (Default: createConfluence = true)
 const createConfluence = ref(true);
@@ -436,6 +465,8 @@ async function handleCreateAll() {
       workType: workType.value,
       subtaskSummary: subtaskSummary.value,
       subtaskDescription: subtaskDescription.value,
+      subtaskDescriptionAdf: subtaskDescriptionAdf.value,
+      images: descriptionImages.value,
       createConfluence: createConfluence.value,
       spaceKey: spaceKey.value,
       parentPageId: parentPageId.value,
@@ -532,9 +563,20 @@ onMounted(async () => {
 
   try {
     const configData = await fetchDefaults();
-    geminiConfigured.value = Boolean(configData.geminiConfigured);
+    geminiConfigured.value = Boolean(
+      configData.geminiConfigured || configData.openrouterConfigured
+    );
     if (configData.geminiModel) {
       geminiModel.value = configData.geminiModel;
+    }
+    if (Array.isArray(configData.aiModels) && configData.aiModels.length > 0) {
+      aiModels.value = configData.aiModels;
+    }
+    const savedModel = window.localStorage.getItem('jira_doc_creator_ai_model');
+    if (savedModel && aiModels.value.includes(savedModel)) {
+      aiModel.value = savedModel;
+    } else if (configData.defaultAiModel) {
+      aiModel.value = configData.defaultAiModel;
     }
     if (savedPrefs?.spaceKey) {
       spaceKey.value = savedPrefs.spaceKey;

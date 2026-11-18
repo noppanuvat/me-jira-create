@@ -91,6 +91,19 @@ export async function executeSyncApplyWorkflow(payload) {
   });
 }
 
+export async function searchJiraUsers(query = '') {
+  const { data } = await request(`/jira/users?query=${encodeURIComponent(query)}`);
+  return Array.isArray(data?.users) ? data.users : [];
+}
+
+export async function improveDescription(payload) {
+  const { data } = await request('/ai/improve-description', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+  return data;
+}
+
 export async function suggestSubtaskNames(payload) {
   const { data } = await request('/ai/suggest-subtask-names', {
     method: 'POST',

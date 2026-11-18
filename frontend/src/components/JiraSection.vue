@@ -224,16 +224,19 @@
         {{ suggestionError }}
       </div>
 
-      <!-- Subtask Description -->
-      <v-textarea
-        :model-value="subtaskDescription"
+      <!-- Subtask Description (rich text, Jira-style) -->
+      <div class="text-subtitle-2 mb-1">Scope &amp; Description</div>
+      <RichDescriptionEditor
+        :model-value="subtaskDescriptionAdf"
+        :text="subtaskDescription"
         :disabled="Boolean(lockedSubtask)"
-        label="Scope &amp; Description"
-        placeholder="Describe objective, acceptance criteria, or key technical context..."
-        rows="3"
-        auto-grow
-        hide-details
-        @update:model-value="$emit('update:subtaskDescription', $event)"
+        :parent-key="selectedParentIssue?.key || ''"
+        :parent-summary="selectedParentIssue?.summary || ''"
+        :work-type="workType"
+        :ai-model="aiModel"
+        @update:model-value="$emit('update:subtaskDescriptionAdf', $event)"
+        @update:text="$emit('update:subtaskDescription', $event)"
+        @update:images="$emit('update:descriptionImages', $event)"
       />
     </div>
   </v-card>
@@ -243,6 +246,7 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { WORK_TYPE_OPTIONS } from '../utils/templateDefinitions.js';
 import { suggestSubtaskNames } from '../services/apiClient.js';
+import RichDescriptionEditor from './RichDescriptionEditor.vue';
 
 const props = defineProps({
   parentIssues: {
@@ -273,9 +277,17 @@ const props = defineProps({
     type: String,
     default: '',
   },
+  subtaskDescriptionAdf: {
+    type: Object,
+    default: null,
+  },
   lockedSubtask: {
     type: Object,
     default: null,
+  },
+  aiModel: {
+    type: String,
+    default: '',
   },
 });
 
@@ -286,6 +298,8 @@ const emit = defineEmits([
   'update:workType',
   'update:subtaskSummary',
   'update:subtaskDescription',
+  'update:subtaskDescriptionAdf',
+  'update:descriptionImages',
   'apply-prefix',
 ]);
 
@@ -367,6 +381,7 @@ async function fetchSuggestions(text) {
       parentDescription: '',
       draftName: text,
       workType: props.workType,
+      model: props.aiModel,
     });
 
     // Discard stale responses if the user kept typing.

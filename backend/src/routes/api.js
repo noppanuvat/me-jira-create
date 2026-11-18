@@ -7,6 +7,7 @@ import {
 import {
   searchParentIssues,
   searchSyncableIssues,
+  searchJiraUsers,
   getJiraIssueSyncContext,
   createJiraSubtask,
   linkConfluencePageToSubtask,
@@ -18,9 +19,25 @@ import {
   getConfluencePageContent,
   updateConfluenceDocPage,
 } from '../services/confluenceService.js';
-import { analyzeJiraForConfluenceSync, suggestSubtaskNames } from '../services/geminiService.js';
+import {
+  analyzeJiraForConfluenceSync,
+  suggestSubtaskNames,
+  improveDescription,
+} from '../services/geminiService.js';
 
 const router = Router();
+
+/** Flattens an ADF document into plain text (used when only ADF is supplied). */
+function extractText(node) {
+  if (!node || typeof node !== 'object') return '';
+  if (node.type === 'text') return node.text || '';
+  const children = Array.isArray(node.content) ? node.content : [];
+  const blockTypes = new Set(['paragraph', 'heading', 'listItem', 'taskItem', 'codeBlock', 'blockquote']);
+  const inner = children.map(extractText).join('');
+  if (blockTypes.has(node.type)) return `${inner}\n`;
+  if (node.type === 'hardBreak') return '\n';
+  return inner;
+}
 
 router.get('/config/defaults', (req, res) => {
   const config = getConfig();
@@ -28,9 +45,59 @@ router.get('/config/defaults', (req, res) => {
     atlassianBaseUrl: config.atlassian.baseUrl,
     geminiConfigured: Boolean(config.gemini?.apiKey),
     geminiModel: config.gemini?.model || 'gemini-2.5-flash',
+    openrouterConfigured: Boolean(config.openrouter?.apiKey),
+    aiModels: config.aiModels || [],
+    defaultAiModel: config.defaultAiModel || config.gemini?.model || 'gemini-2.5-flash',
     defaults: config.defaults,
     templates: Object.values(TEMPLATE_METADATA),
   });
+});
+
+/**
+ * Jira user lookup for the @mention menu in the rich description editor.
+ */
+router.get('/jira/users', async (req, res, next) => {
+  try {
+    const query = String(req.query.query || '').trim();
+    const users = await searchJiraUsers(query);
+    res.json({ users });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * Rewrites a rich-text description with Gemini. Returns ADF + markdown;
+ * the UI previews the result and only applies it when the user accepts.
+ */
+router.post('/ai/improve-description', async (req, res, next) => {
+  try {
+    const { text, adf, parentKey, parentSummary, workType, model } = req.body || {};
+    const source = String(
+      text || (adf ? extractText(adf) : '')
+    ).trim();
+
+    if (!source) {
+      return res.status(400).json({ error: { message: 'text is required.' } });
+    }
+    if (source.length > 12000) {
+      return res.status(400).json({
+        error: { message: 'Description is too long (12000 characters max).' },
+      });
+    }
+
+    const result = await improveDescription({
+      text: source,
+      parentKey: String(parentKey || '').trim(),
+      parentSummary: String(parentSummary || '').trim(),
+      workType: String(workType || '').trim(),
+      model: String(model || '').trim(),
+    });
+
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
 });
 
 /**
@@ -39,7 +106,7 @@ router.get('/config/defaults', (req, res) => {
  */
 router.post('/ai/suggest-subtask-names', async (req, res, next) => {
   try {
-    const { parentKey, parentSummary, parentDescription, draftName, workType } =
+    const { parentKey, parentSummary, parentDescription, draftName, workType, model } =
       req.body || {};
     const draft = String(draftName || '').trim();
 
@@ -60,6 +127,7 @@ router.post('/ai/suggest-subtask-names', async (req, res, next) => {
       parentDescription: String(parentDescription || '').slice(0, 2000),
       draftName: draft,
       workType: String(workType || '').trim(),
+      model: String(model || '').trim(),
     });
 
     res.json(result);
@@ -149,6 +217,8 @@ router.post('/workflow/create-all', async (req, res, next) => {
       workType = 'API_DEVELOPMENT',
       subtaskSummary,
       subtaskDescription,
+      subtaskDescriptionAdf,
+      images,
       createConfluence = true,
       spaceKey,
       parentPageId,
@@ -161,6 +231,8 @@ router.post('/workflow/create-all', async (req, res, next) => {
       parentIssueKey,
       summary: subtaskSummary,
       description: subtaskDescription,
+      descriptionAdf: subtaskDescriptionAdf,
+      images,
       workType,
     });
 
@@ -411,7 +483,7 @@ router.post('/workflow/retry-confluence', async (req, res, next) => {
  */
 router.post('/workflow/sync-analyze', async (req, res, next) => {
   try {
-    const { issueKey, confluencePageId, workType } = req.body || {};
+    const { issueKey, confluencePageId, workType, model } = req.body || {};
     if (!issueKey) {
       return res.status(400).json({
         error: { message: 'Jira issueKey is required for AI sync analysis.' },
@@ -438,6 +510,7 @@ router.post('/workflow/sync-analyze', async (req, res, next) => {
       issueContext,
       currentConfluencePage,
       workType: targetWorkType,
+      model: String(model || '').trim(),
     });
 
     res.json({

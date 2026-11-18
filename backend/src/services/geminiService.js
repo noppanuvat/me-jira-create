@@ -5,6 +5,122 @@ import {
   ensureRequiredApiHeaders,
   ensureRequiredDbColumns,
 } from '../templates/confluenceTemplates.js';
+import { markdownToAdf } from '../utils/markdownToAdf.js';
+
+function isOpenRouterModel(model) {
+  return String(model || '').includes('/');
+}
+
+/**
+ * Sends a single prompt to the selected AI model and returns plain text.
+ * Routes to OpenRouter when the model id contains "/" (e.g. google/gemini-4-hydrogen),
+ * otherwise to the Gemini generateContent API.
+ */
+async function callAi({ prompt, model, temperature = 0.2, jsonMode = false, maxTokens = 0 }) {
+  const config = getConfig();
+  const resolvedModel =
+    String(model || '').trim() || config.gemini?.model || 'gemini-2.5-flash';
+
+  if (isOpenRouterModel(resolvedModel)) {
+    if (resolvedModel.endsWith(':batch')) {
+      throw new AtlassianApiError(
+        `Model "${resolvedModel}" is batch-only (OpenRouter /api/v1/batches) and cannot be used for real-time requests. Use "${resolvedModel.replace(/:batch$/, '')}" instead.`,
+        400
+      );
+    }
+
+    const apiKey = config.openrouter?.apiKey;
+    if (!apiKey) {
+      throw new AtlassianApiError(
+        'OPENROUTER_API_KEY is not configured in .env. Please add OPENROUTER_API_KEY to use OpenRouter models.',
+        400
+      );
+    }
+
+    const body = {
+      model: resolvedModel,
+      temperature,
+      messages: [{ role: 'user', content: prompt }],
+    };
+    if (jsonMode) body.response_format = { type: 'json_object' };
+    if (maxTokens) body.max_tokens = maxTokens;
+
+    const response = await fetch(config.openrouter.url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+        'HTTP-Referer': 'https://jira-create.meturr.online',
+        'X-Title': 'Jira Doc Creator',
+      },
+      body: JSON.stringify(body),
+    });
+
+    const rawBody = await response.text();
+    let data = null;
+    try {
+      data = rawBody ? JSON.parse(rawBody) : null;
+    } catch {
+      data = null;
+    }
+
+    if (!response.ok) {
+      const errMsg =
+        data?.error?.message || `OpenRouter request failed with status ${response.status}`;
+      throw new AtlassianApiError(errMsg, response.status, data);
+    }
+
+    const content = data?.choices?.[0]?.message?.content;
+    const text = Array.isArray(content)
+      ? content.map((p) => p?.text || '').join('')
+      : String(content || '');
+
+    return { model: resolvedModel, text };
+  }
+
+  const apiKey = config.gemini?.apiKey;
+  if (!apiKey) {
+    throw new AtlassianApiError(
+      'GEMINI_API_KEY is not configured in .env. Please add GEMINI_API_KEY to use Gemini AI.',
+      400
+    );
+  }
+
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    resolvedModel
+  )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const generationConfig = { temperature };
+  if (jsonMode) generationConfig.responseMimeType = 'application/json';
+  if (maxTokens) generationConfig.maxOutputTokens = maxTokens;
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig,
+    }),
+  });
+
+  const rawBody = await response.text();
+  let data = null;
+  try {
+    data = rawBody ? JSON.parse(rawBody) : null;
+  } catch {
+    data = null;
+  }
+
+  if (!response.ok) {
+    const errMsg =
+      data?.error?.message || `Gemini API request failed with status ${response.status}`;
+    throw new AtlassianApiError(errMsg, response.status, data);
+  }
+
+  const candidateText =
+    data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
+
+  return { model: resolvedModel, text: candidateText };
+}
 
 function buildPrompt({ issueContext, currentConfluencePage, workType }) {
   const isDb = workType === WORK_TYPES.DATABASE_DESIGN;
@@ -178,74 +294,32 @@ export async function analyzeJiraForConfluenceSync({
   issueContext,
   currentConfluencePage = null,
   workType = WORK_TYPES.API_DEVELOPMENT,
+  model: requestedModel = '',
 }) {
-  const config = getConfig();
-  const apiKey = config.gemini?.apiKey;
-  const model = config.gemini?.model || 'gemini-2.5-flash';
-
-  if (!apiKey) {
-    throw new AtlassianApiError(
-      'GEMINI_API_KEY is not configured in .env. Please add GEMINI_API_KEY to use Gemini AI analysis.',
-      400
-    );
-  }
-
   const prompt = buildPrompt({ issueContext, currentConfluencePage, workType });
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    model
-  )}:generateContent?key=${encodeURIComponent(apiKey)}`;
-
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      contents: [
-        {
-          role: 'user',
-          parts: [{ text: prompt }],
-        },
-      ],
-      generationConfig: {
-        temperature: 0.2,
-        responseMimeType: 'application/json',
-      },
-    }),
+  const { model, text } = await callAi({
+    prompt,
+    model: requestedModel,
+    temperature: 0.2,
+    jsonMode: true,
   });
 
-  const rawBody = await response.text();
-  let data = null;
-  try {
-    data = rawBody ? JSON.parse(rawBody) : null;
-  } catch {
-    data = null;
-  }
-
-  if (!response.ok) {
-    const errMsg =
-      data?.error?.message || `Gemini API request failed with status ${response.status}`;
-    throw new AtlassianApiError(errMsg, response.status, data);
-  }
-
-  const candidateText =
-    data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
-  if (!candidateText.trim()) {
-    throw new AtlassianApiError('Gemini returned an empty analysis response.', 502);
+  if (!String(text || '').trim()) {
+    throw new AtlassianApiError('AI returned an empty analysis response.', 502);
   }
 
   let parsedResult;
   try {
-    const cleaned = candidateText
+    const cleaned = String(text)
       .replace(/^```json\s*/i, '')
       .replace(/```$/i, '')
       .trim();
     parsedResult = JSON.parse(cleaned);
   } catch (err) {
     throw new AtlassianApiError(
-      `Failed to parse Gemini JSON output: ${err.message}`,
+      `Failed to parse AI JSON output: ${err.message}`,
       502,
-      candidateText
+      text
     );
   }
 
@@ -310,29 +384,71 @@ function cleanSuggestionText(value) {
 }
 
 /**
- * Suggests improved, grammatically correct English subtask names for a draft name.
- * Used by the "AI suggestions" helper in the subtask name fields.
+ * Rewrites a subtask description into structured Markdown (Objective / Scope /
+ * Acceptance Criteria / Technical Notes) and returns it as ADF for the editor.
  */
+export async function improveDescription({
+  text = '',
+  parentKey = '',
+  parentSummary = '',
+  workType = '',
+  model: requestedModel = '',
+} = {}) {
+  const source = String(text || '').trim();
+
+  if (!source) {
+    throw new AtlassianApiError('Description text is required to improve it.', 400);
+  }
+
+  const prompt = `You are a senior business analyst writing Jira subtask descriptions for a software engineering team.
+
+Parent Jira Issue: ${parentKey || 'N/A'}${parentSummary ? ` — ${parentSummary}` : ''}
+Work Type: ${workType || 'N/A'}
+
+Current description:
+"""
+${source.slice(0, 12000)}
+"""
+
+Rewrite it so it is clear, complete and well structured for a Jira subtask. Rules:
+- Output MUST be in English only.
+- Preserve every fact, number, name and requirement from the original — never invent scope, dates or acceptance criteria.
+- Structure the output with these sections when the content supports them: "Objective", "Scope", "Acceptance Criteria", "Technical Notes".
+- Use Markdown: "## " for section headings, "- " for bullets, "1. " for ordered steps, "**bold**" for emphasis, and inline code with backticks.
+- Keep it concise: 120-400 words.
+- Do not wrap the whole answer in a code fence and do not add commentary before or after the description.`;
+
+  const { model, text: aiText } = await callAi({
+    prompt,
+    model: requestedModel,
+    temperature: 0.35,
+    maxTokens: 2048,
+  });
+
+  const markdown = String(aiText || '')
+    .replace(/^\s*```(?:markdown|md)?\s*/i, '')
+    .replace(/```\s*$/i, '')
+    .trim();
+
+  if (!markdown) {
+    throw new AtlassianApiError('AI returned an empty description.', 502);
+  }
+
+  return { model, adf: markdownToAdf(markdown), markdown };
+}
+
 export async function suggestSubtaskNames({
   parentKey = '',
   parentSummary = '',
   parentDescription = '',
   draftName = '',
   workType = '',
+  model: requestedModel = '',
 }) {
-  const config = getConfig();
-  const apiKey = config.gemini?.apiKey;
-  const model = config.gemini?.model || 'gemini-2.5-flash';
   const draft = String(draftName || '').trim();
 
   if (!draft) {
     throw new AtlassianApiError('draftName is required to suggest subtask names.', 400);
-  }
-  if (!apiKey) {
-    throw new AtlassianApiError(
-      'GEMINI_API_KEY is not configured in .env. Please add GEMINI_API_KEY to use AI suggestions.',
-      400
-    );
   }
 
   const prompt = `You are a Jira subtask naming assistant for a software engineering team.
@@ -351,50 +467,18 @@ Rules:
 - Do not add numbering, bullet characters, quotes, markdown, or explanations.
 - Return ONLY valid JSON in this shape: {"suggestions": ["First suggestion", "Second suggestion"]}`;
 
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    model
-  )}:generateContent?key=${encodeURIComponent(apiKey)}`;
-
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      contents: [
-        {
-          role: 'user',
-          parts: [{ text: prompt }],
-        },
-      ],
-      generationConfig: {
-        temperature: 0.4,
-        responseMimeType: 'application/json',
-      },
-    }),
+  const { model, text: aiText } = await callAi({
+    prompt,
+    model: requestedModel,
+    temperature: 0.4,
+    jsonMode: true,
   });
 
-  const rawBody = await response.text();
-  let data = null;
-  try {
-    data = rawBody ? JSON.parse(rawBody) : null;
-  } catch {
-    data = null;
+  if (!String(aiText || '').trim()) {
+    throw new AtlassianApiError('AI returned an empty suggestion response.', 502);
   }
 
-  if (!response.ok) {
-    const errMsg =
-      data?.error?.message || `Gemini API request failed with status ${response.status}`;
-    throw new AtlassianApiError(errMsg, response.status, data);
-  }
-
-  const candidateText =
-    data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
-  if (!candidateText.trim()) {
-    throw new AtlassianApiError('Gemini returned an empty suggestion response.', 502);
-  }
-
-  const cleaned = candidateText
+  const cleaned = String(aiText)
     .replace(/^```json\s*/i, '')
     .replace(/```$/i, '')
     .trim();
