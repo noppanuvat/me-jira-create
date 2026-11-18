@@ -1,0 +1,25 @@
+# Secrets / config
+.env
+
+# Logs
+*.log
+backend.log
+
+# Dependencies
+node_modules/
+
+# Build output
+frontend/dist/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# npm
+npm-debug.log*
+package-lock.json

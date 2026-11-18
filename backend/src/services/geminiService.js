@@ -1,0 +1,301 @@
+import { getConfig } from '../config/env.js';
+import { AtlassianApiError } from '../clients/atlassianClient.js';
+import {
+  WORK_TYPES,
+  ensureRequiredApiHeaders,
+  ensureRequiredDbColumns,
+} from '../templates/confluenceTemplates.js';
+
+function buildPrompt({ issueContext, currentConfluencePage, workType }) {
+  const isDb = workType === WORK_TYPES.DATABASE_DESIGN;
+
+  const commentsText =
+    Array.isArray(issueContext.comments) && issueContext.comments.length > 0
+      ? issueContext.comments
+          .map((c, idx) => `Comment #${idx + 1} (${c.author || 'User'}): ${c.bodyText}`)
+          .join('\n\n')
+      : 'No comments.';
+
+  const currentStorageHtml = currentConfluencePage?.storageHtml
+    ? currentConfluencePage.storageHtml.slice(0, 12000)
+    : 'No existing Confluence content.';
+
+  if (isDb) {
+    return `You are a Senior Software Architect. Analyze the Jira issue details (Summary, Description, and Comments) along with the existing Confluence page HTML, and extract structured Database Design specification fields that strictly match our Confluence Database Design template.
+
+Pay special attention to:
+- Every table specification in "columns" MUST always include these 4 mandatory audit columns at the end:
+  * "created_at" (dataType: "DATETIME2", nullable: "NO", defaultValue: "SYSDATETIME()", description: "Record creation timestamp")
+  * "updated_at" (dataType: "DATETIME2", nullable: "NO", defaultValue: "SYSDATETIME()", description: "Record last updated timestamp")
+  * "created_by" (dataType: "VARCHAR(50)", nullable: "NO", defaultValue: "-", description: "User or system that created the record")
+  * "updated_by" (dataType: "VARCHAR(50)", nullable: "NO", defaultValue: "-", description: "User or system that last updated the record")
+
+Jira Issue Key: ${issueContext.key}
+Jira Summary: ${issueContext.summary}
+Jira Parent Issue: ${issueContext.parentIssueKey || 'N/A'} - ${issueContext.parentIssueSummary || ''}
+Jira Description:
+${issueContext.descriptionText || 'No description'}
+
+Jira Comments:
+${commentsText}
+
+Existing Confluence Storage HTML:
+${currentStorageHtml}
+
+Return a valid JSON object matching this exact structure:
+{
+  "workType": "DATABASE_DESIGN",
+  "changeSummary": [
+    "Short bullet describing what was extracted or updated from Jira"
+  ],
+  "subtaskDescription": "Clean, concise overview & data purpose synthesized from Jira",
+  "templateFields": {
+    "schemaName": "e.g. dbo or payment",
+    "tableName": "e.g. qr_payment_transactions",
+    "erdSummary": "Entity relationship and schema summary",
+    "columns": [
+      {
+        "name": "column_name",
+        "dataType": "NVARCHAR(64) / BIGINT / UNIQUEIDENTIFIER / DATETIME2",
+        "nullable": "NO or YES",
+        "defaultValue": "IDENTITY(1,1) / SYSDATETIME() / -",
+        "description": "Column purpose"
+      }
+    ],
+    "indexes": [
+      {
+        "name": "idx_name",
+        "type": "PRIMARY KEY / UNIQUE / INDEX (B-Tree)",
+        "columns": "(col1, col2)",
+        "notes": "Query access pattern"
+      }
+    ]
+  }
+}`;
+  }
+
+  return `You are a Senior Software Architect. Analyze the Jira issue details (Summary, Description, and Comments) along with the existing Confluence page HTML, and extract structured API Development specification fields that strictly match our Confluence API Development template.
+
+Pay special attention to:
+1. All Request parameters — including Headers, Path parameters, Query parameters, AND every field inside the Request Body JSON — must be unified into "headersAndParams" (Section 3.1 Headers & Parameters) with its location ("Header", "Path", "Query", or "Body"), data type, whether it is "Mandatory" or "Optional", an example value ("example"), and description.
+   - Always include standard request headers in "headersAndParams":
+     * "Authorization" (location: "Header", type: "String", mandatory: "Mandatory", example: "Bearer <jwe_token>", description: "JWE Token (สามารถแกะ memberId ออกมาได้)")
+     * "Accept-Language" (location: "Header", type: "String", mandatory: "Mandatory", example: "th / en", description: "Language preference (th/en)")
+     * "Content-Type" (location: "Header", type: "String", mandatory: "Mandatory", example: "application/json", description: "JSON request content type")
+2. All Response fields — every field inside the Response Body JSON — must be extracted into "responseFields" (Section 4.1 Response Fields) with its data type, whether it is "Mandatory" or "Optional", an example value ("example"), and description.
+   - STRICT RULE FOR EMPTY RESPONSE ({}): If the sample response in Jira is {} (an empty JSON object) or has no fields, "responseFields" MUST be an empty array [] and "responsePayloadJson" MUST be "{}". Do NOT copy or keep placeholder fields (such as "code" or "data") from the existing Confluence HTML.
+3. STRICT RULE: Do NOT invent or auto-insert "requestId" (or any other extra field) into "headersAndParams" or "requestPayloadJson" unless it is explicitly present in the Jira Description or Jira Comments. If "requestId" was only a placeholder in the existing Confluence HTML and is NOT in Jira, remove it.
+4. For Section 4.3 Status & Error Codes ("statusCodes"):
+   - When the Jira Description or Comments mention specific Exception class names (for example: "throw ApplicationNotFoundFieldException (412)", "throw ApplicationInvalidFieldException (412)", "throw CustomerInformationNotFoundException (500)", "throw PrescreenType1Exception (412)"), you MUST use the exact Exception class name in the "errorCode" field (e.g. "ApplicationNotFoundFieldException") instead of a generic error code, pair it with its HTTP status code in "httpStatus" (e.g. "412", "500", "410/417"), and describe the condition in "scenario". Create a separate entry in "statusCodes" for each exception/error case mentioned in Jira.
+
+Jira Issue Key: ${issueContext.key}
+Jira Summary: ${issueContext.summary}
+Jira Parent Issue: ${issueContext.parentIssueKey || 'N/A'} - ${issueContext.parentIssueSummary || ''}
+Jira Description:
+${issueContext.descriptionText || 'No description'}
+
+Jira Comments:
+${commentsText}
+
+Existing Confluence Storage HTML:
+${currentStorageHtml}
+
+Return a valid JSON object matching this exact structure:
+{
+  "workType": "API_DEVELOPMENT",
+  "changeSummary": [
+    "Short bullet describing what was extracted or updated from Jira (e.g. Updated 3.1 Headers & Parameters and 4.1 Response Fields)"
+  ],
+  "subtaskDescription": "Clean, concise objective & context synthesized from Jira",
+  "templateFields": {
+    "httpMethod": "GET | POST | PUT | PATCH | DELETE",
+    "endpointPath": "/api/v1/...",
+    "serviceName": "Target service name",
+    "headersAndParams": [
+      {
+        "name": "Parameter or JSON field name (e.g. Authorization, Accept-Language, or request fields)",
+        "location": "Header | Path | Query | Body",
+        "type": "String | Number | Boolean | Object | Array",
+        "mandatory": "Mandatory | Optional",
+        "example": "Sample value (e.g. application/json, 150.00, M-001)",
+        "description": "What this request field/parameter represents"
+      }
+    ],
+    "requestPayloadJson": "Formatted JSON string of the sample request body",
+    "responseFields": [
+      {
+        "name": "Response JSON field name",
+        "type": "String | Number | Boolean | Object | Array",
+        "mandatory": "Mandatory | Optional",
+        "example": "Sample value (e.g. QR-9981, SUCCESS)",
+        "description": "What this response field represents"
+      }
+    ],
+    "responsePayloadJson": "Formatted JSON string of the sample response body",
+    "statusCodes": [
+      {
+        "httpStatus": "200 / 412 / 500 / ...",
+        "errorCode": "Exception class name if specified in Jira (e.g. ApplicationNotFoundFieldException), otherwise error code / SUCCESS",
+        "scenario": "When this status or exception is returned"
+      }
+    ]
+  }
+}`;
+}
+
+function normalizePrettyJsonString(value, fallback = '') {
+  if (!value) return fallback;
+  if (typeof value === 'object') {
+    return JSON.stringify(value, null, 2);
+  }
+  const str = String(value).trim();
+  if (!str) return fallback;
+  try {
+    return JSON.stringify(JSON.parse(str), null, 2);
+  } catch {
+    return str;
+  }
+}
+
+function isEmptyJsonObjectString(value) {
+  const str = String(value || '').trim();
+  if (!str) return false;
+  if (str === '{}') return true;
+  try {
+    const parsed = JSON.parse(str);
+    return (
+      Boolean(parsed) &&
+      typeof parsed === 'object' &&
+      !Array.isArray(parsed) &&
+      Object.keys(parsed).length === 0
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function analyzeJiraForConfluenceSync({
+  issueContext,
+  currentConfluencePage = null,
+  workType = WORK_TYPES.API_DEVELOPMENT,
+}) {
+  const config = getConfig();
+  const apiKey = config.gemini?.apiKey;
+  const model = config.gemini?.model || 'gemini-2.5-flash';
+
+  if (!apiKey) {
+    throw new AtlassianApiError(
+      'GEMINI_API_KEY is not configured in .env. Please add GEMINI_API_KEY to use Gemini AI analysis.',
+      400
+    );
+  }
+
+  const prompt = buildPrompt({ issueContext, currentConfluencePage, workType });
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    model
+  )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: prompt }],
+        },
+      ],
+      generationConfig: {
+        temperature: 0.2,
+        responseMimeType: 'application/json',
+      },
+    }),
+  });
+
+  const rawBody = await response.text();
+  let data = null;
+  try {
+    data = rawBody ? JSON.parse(rawBody) : null;
+  } catch {
+    data = null;
+  }
+
+  if (!response.ok) {
+    const errMsg =
+      data?.error?.message || `Gemini API request failed with status ${response.status}`;
+    throw new AtlassianApiError(errMsg, response.status, data);
+  }
+
+  const candidateText =
+    data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
+  if (!candidateText.trim()) {
+    throw new AtlassianApiError('Gemini returned an empty analysis response.', 502);
+  }
+
+  let parsedResult;
+  try {
+    const cleaned = candidateText
+      .replace(/^```json\s*/i, '')
+      .replace(/```$/i, '')
+      .trim();
+    parsedResult = JSON.parse(cleaned);
+  } catch (err) {
+    throw new AtlassianApiError(
+      `Failed to parse Gemini JSON output: ${err.message}`,
+      502,
+      candidateText
+    );
+  }
+
+  const resolvedWorkType =
+    parsedResult.workType === WORK_TYPES.DATABASE_DESIGN ||
+    workType === WORK_TYPES.DATABASE_DESIGN
+      ? WORK_TYPES.DATABASE_DESIGN
+      : WORK_TYPES.API_DEVELOPMENT;
+
+  const tf = parsedResult.templateFields || {};
+  const normalizedResponsePayload = normalizePrettyJsonString(tf.responsePayloadJson, '');
+  const isResponseEmptyObj = isEmptyJsonObjectString(normalizedResponsePayload);
+
+  return {
+    workType: resolvedWorkType,
+    model,
+    changeSummary: Array.isArray(parsedResult.changeSummary)
+      ? parsedResult.changeSummary
+      : ['Extracted latest specification details from Jira card'],
+    subtaskDescription:
+      parsedResult.subtaskDescription || issueContext.descriptionText || issueContext.summary,
+    templateFields: {
+      httpMethod: tf.httpMethod || 'POST',
+      endpointPath: tf.endpointPath || '/api/v1/resource',
+      serviceName: tf.serviceName || 'Core Backend Service',
+      headersAndParams:
+        resolvedWorkType === WORK_TYPES.API_DEVELOPMENT
+          ? ensureRequiredApiHeaders(tf.headersAndParams)
+          : Array.isArray(tf.headersAndParams)
+            ? tf.headersAndParams
+            : [],
+      requestPayloadJson: normalizePrettyJsonString(tf.requestPayloadJson, ''),
+      responseFields: isResponseEmptyObj
+        ? []
+        : Array.isArray(tf.responseFields)
+          ? tf.responseFields
+          : [],
+      responsePayloadJson: normalizedResponsePayload,
+      statusCodes: Array.isArray(tf.statusCodes) ? tf.statusCodes : [],
+      dbEngine: 'SQL Server',
+      schemaName: tf.schemaName || 'dbo',
+      tableName: tf.tableName || 'sample_entity_table',
+      erdSummary: tf.erdSummary || '',
+      columns:
+        resolvedWorkType === WORK_TYPES.DATABASE_DESIGN
+          ? ensureRequiredDbColumns(tf.columns)
+          : Array.isArray(tf.columns)
+            ? tf.columns
+            : [],
+      indexes: Array.isArray(tf.indexes) ? tf.indexes : [],
+    },
+  };
+}
